@@ -345,7 +345,7 @@ if_hyper! {
     pub use self::async_impl::{
         Body, Client, ClientBuilder, Request, RequestBuilder, Response, Upgraded,
     };
-    pub use self::proxy::{Proxy,NoProxy};
+    pub use self::proxy::{Proxy,NoProxy, CustomProxyConnector, CustomProxyStream};
     #[cfg(feature = "__tls")]
     // Re-exports, to be removed in a future release
     pub use tls::{Certificate, Identity};

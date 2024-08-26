@@ -1,11 +1,15 @@
-use std::fmt;
+use std::fmt::{self, Debug};
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
+use std::pin::{pin, Pin};
 use std::sync::Arc;
 
+use crate::error::BoxError;
 use crate::into_url::{IntoUrl, IntoUrlSealed};
 use crate::Url;
+use futures_core::future::BoxFuture;
 use http::{header::HeaderValue, Uri};
+use hyper_util::client::legacy::connect::{Connected, Connection};
 use ipnet::IpNet;
 use once_cell::sync::Lazy;
 use percent_encoding::percent_decode;
@@ -29,6 +33,7 @@ use system_configuration::{
     sys::schema_definitions::kSCPropNetProxiesHTTPSPort,
     sys::schema_definitions::kSCPropNetProxiesHTTPSProxy,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Configuration of a proxy that a `Client` should pass requests to.
 ///
@@ -111,6 +116,92 @@ pub enum ProxyScheme {
         auth: Option<(String, String)>,
         remote_dns: bool,
     },
+    Custom {
+        connector: CustomProxyConnector,
+    },
+}
+
+/// A trait for custom proxy stream
+pub trait CustomProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static> CustomProxyStream for T {}
+
+type ConnectorFn = dyn Fn(Uri) -> BoxFuture<'static, Result<Box<dyn CustomProxyStream>, BoxError>>
+    + Send
+    + Sync
+    + 'static;
+
+/// A custom proxy connector
+#[derive(Clone)]
+pub struct CustomProxyConnector {
+    connector: Arc<ConnectorFn>,
+}
+
+impl Debug for CustomProxyConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomProxyConnector").finish()
+    }
+}
+
+impl CustomProxyConnector {
+    /// Create a new custom proxy connector
+    pub fn new<F>(connector: F) -> Self
+    where
+        F: Fn(Uri) -> BoxFuture<'static, Result<Box<dyn CustomProxyStream>, BoxError>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            connector: Arc::new(connector),
+        }
+    }
+
+    pub(crate) async fn connect(&self, dst: Uri) -> Result<CustomStream, BoxError> {
+        (self.connector)(dst).await.map(|io| CustomStream { io })
+    }
+}
+
+pub(crate) struct CustomStream {
+    io: Box<dyn CustomProxyStream>,
+}
+
+impl AsyncRead for CustomStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        pin!(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CustomStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        pin!(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        pin!(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        pin!(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+impl Connection for CustomStream {
+    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+        Connected::new()
+    }
 }
 
 impl ProxyScheme {
@@ -118,7 +209,8 @@ impl ProxyScheme {
         match self {
             ProxyScheme::Http { auth, .. } | ProxyScheme::Https { auth, .. } => auth.as_ref(),
             #[cfg(feature = "socks")]
-            _ => None,
+            ProxyScheme::Socks5 { .. } => None,
+            ProxyScheme::Custom { .. } => None,
         }
     }
 }
@@ -128,6 +220,12 @@ impl ProxyScheme {
 /// built directly using the factory methods.
 pub trait IntoProxyScheme {
     fn into_proxy_scheme(self) -> crate::Result<ProxyScheme>;
+}
+
+impl IntoProxyScheme for CustomProxyConnector {
+    fn into_proxy_scheme(self) -> crate::Result<ProxyScheme> {
+        Ok(ProxyScheme::Custom { connector: self })
+    }
 }
 
 impl<S: IntoUrl> IntoProxyScheme for S {
@@ -631,6 +729,9 @@ impl ProxyScheme {
             ProxyScheme::Socks5 { ref mut auth, .. } => {
                 *auth = Some((username.into(), password.into()));
             }
+            ProxyScheme::Custom { .. } => {
+                panic!("Custom proxy scheme doesn't support basic auth");
+            }
         }
     }
 
@@ -645,6 +746,9 @@ impl ProxyScheme {
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => {
                 panic!("Socks is not supported for this method")
+            }
+            ProxyScheme::Custom { .. } => {
+                panic!("Custom proxy scheme doesn't support custom http auth");
             }
         }
     }
@@ -663,6 +767,7 @@ impl ProxyScheme {
             }
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => {}
+            ProxyScheme::Custom { .. } => {}
         }
 
         self
@@ -716,6 +821,7 @@ impl ProxyScheme {
             ProxyScheme::Https { .. } => "https",
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => "socks5",
+            ProxyScheme::Custom { .. } => "custom",
         }
     }
 
@@ -726,6 +832,7 @@ impl ProxyScheme {
             ProxyScheme::Https { host, .. } => host.as_str(),
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => panic!("socks5"),
+            ProxyScheme::Custom { .. } => panic!("custom"),
         }
     }
 }
@@ -744,6 +851,7 @@ impl fmt::Debug for ProxyScheme {
                 let h = if *remote_dns { "h" } else { "" };
                 write!(f, "socks5{h}://{addr}")
             }
+            ProxyScheme::Custom { .. } => write!(f, "custom"),
         }
     }
 }
@@ -1123,7 +1231,8 @@ mod tests {
             ProxyScheme::Http { host, .. } => ("http", host),
             ProxyScheme::Https { host, .. } => ("https", host),
             #[cfg(feature = "socks")]
-            _ => panic!("intercepted as socks"),
+            ProxyScheme::Socks5 => panic!("intercepted as socks"),
+            ProxyScheme::Custom { .. } => panic!("intercepted as custom"),
         };
         http::Uri::builder()
             .scheme(scheme)
